@@ -3,6 +3,7 @@ import functools
 import os
 import sys
 import threading
+import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
 
 from .current_thread_executor import CurrentThreadExecutor
@@ -12,6 +13,84 @@ try:
     import contextvars  # Python 3.7+ only.
 except ImportError:
     contextvars = None
+
+import asyncio
+import asyncio.coroutines
+import contextvars
+import functools
+import inspect
+import os
+import sys
+import threading
+import warnings
+import weakref
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Any, Callable, Dict, Optional, overload
+
+from .current_thread_executor import CurrentThreadExecutor
+from .local import Local
+
+
+def _restore_context(context):
+    # Check for changes in contextvars, and set them to the current
+    # context for downstream consumers
+    for cvar in context:
+        try:
+            if cvar.get() != context.get(cvar):
+                cvar.set(context.get(cvar))
+        except LookupError:
+            cvar.set(context.get(cvar))
+
+
+def _iscoroutinefunction_or_partial(func: Any) -> bool:
+    # Python < 3.8 does not correctly determine partially wrapped
+    # coroutine functions are coroutine functions, hence the need for
+    # this to exist. Code taken from CPython.
+    if sys.version_info >= (3, 8):
+        return asyncio.iscoroutinefunction(func)
+    else:
+        while inspect.ismethod(func):
+            func = func.__func__
+        while isinstance(func, functools.partial):
+            func = func.func
+
+        return asyncio.iscoroutinefunction(func)
+
+
+class ThreadSensitiveContext:
+    """Async context manager to manage context for thread sensitive mode
+    This context manager controls which thread pool executor is used when in
+    thread sensitive mode. By default, a single thread pool executor is shared
+    within a process.
+    In Python 3.7+, the ThreadSensitiveContext() context manager may be used to
+    specify a thread pool per context.
+    This context manager is re-entrant, so only the outer-most call to
+    ThreadSensitiveContext will set the context.
+    Usage:
+    >>> import time
+    >>> async with ThreadSensitiveContext():
+    ...     await sync_to_async(time.sleep, 1)()
+    """
+
+    def __init__(self):
+        self.token = None
+
+    async def __aenter__(self):
+        try:
+            SyncToAsync.thread_sensitive_context.get()
+        except LookupError:
+            self.token = SyncToAsync.thread_sensitive_context.set(self)
+
+        return self
+
+    async def __aexit__(self, exc, value, tb):
+        if not self.token:
+            return
+
+        executor = SyncToAsync.context_to_thread_executor.pop(self, None)
+        if executor:
+            executor.shutdown()
+        SyncToAsync.thread_sensitive_context.reset(self.token)
 
 
 class AsyncToSync:
@@ -33,6 +112,27 @@ class AsyncToSync:
     # Keeps track of which CurrentThreadExecutor to use. This uses an asgiref
     # Local, not a threadlocal, so that tasks can work out what their parent used.
     executors = Local()
+
+    # Single-thread executor for thread-sensitive code
+    single_thread_executor = ThreadPoolExecutor(max_workers=1)
+
+    # Maintain a contextvar for the current execution context. Optionally used
+    # for thread sensitive mode.
+    thread_sensitive_context: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+        "thread_sensitive_context"
+    )
+
+    # Contextvar that is used to detect if the single thread executor
+    # would be awaited on while already being used in the same context
+    deadlock_context: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+        "deadlock_context"
+    )
+
+    # Maintaining a weak reference to the context ensures that thread pools are
+    # erased once the context goes out of scope. This terminates the thread pool.
+    context_to_thread_executor: "weakref.WeakKeyDictionary[object, ThreadPoolExecutor]" = (
+        weakref.WeakKeyDictionary()
+    )
 
     def __init__(self, awaitable, force_new_loop=False):
         self.awaitable = awaitable
