@@ -295,6 +295,24 @@ class SyncToAsync:
     # Single-thread executor for thread-sensitive code
     single_thread_executor = ThreadPoolExecutor(max_workers=1)
 
+    # Maintain a contextvar for the current execution context. Optionally used
+    # for thread sensitive mode.
+    thread_sensitive_context: "contextvars.ContextVar[ThreadSensitiveContext]" = (
+        contextvars.ContextVar("thread_sensitive_context")
+    )
+
+    # Contextvar that is used to detect if the single thread executor
+    # would be awaited on while already being used in the same context
+    deadlock_context: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+        "deadlock_context"
+    )
+
+    # Maintaining a weak reference to the context ensures that thread pools are
+    # erased once the context goes out of scope. This terminates the thread pool.
+    context_to_thread_executor: "weakref.WeakKeyDictionary[ThreadSensitiveContext, ThreadPoolExecutor]" = (
+        weakref.WeakKeyDictionary()
+    )
+
     def __init__(self, func, thread_sensitive=False):
         self.func = func
         self._thread_sensitive = thread_sensitive
@@ -396,3 +414,38 @@ class SyncToAsync:
 # Lowercase is more sensible for most things
 sync_to_async = SyncToAsync
 async_to_sync = AsyncToSync
+
+_F = Any
+
+
+# Python 3.12 deprecates asyncio.iscoroutinefunction() as an alias for
+# inspect.iscoroutinefunction(), whilst also removing the _is_coroutine marker.
+# The latter is replaced with the inspect.markcoroutinefunction decorator.
+# Until 3.12 is the minimum supported Python version, provide a shim.
+# Django 4.0 only supports 3.8+, so don't concern with the _or_partial backport.
+
+if hasattr(inspect, "markcoroutinefunction"):
+    iscoroutinefunction = inspect.iscoroutinefunction
+    markcoroutinefunction: Callable[[_F], _F] = inspect.markcoroutinefunction
+else:
+    iscoroutinefunction = asyncio.iscoroutinefunction  # type: ignore[assignment]
+
+    def markcoroutinefunction(func: _F) -> _F:
+        func._is_coroutine = asyncio.coroutines._is_coroutine  # type: ignore
+        return func
+
+
+if sys.version_info >= (3, 8):
+    _iscoroutinefunction_or_partial = iscoroutinefunction
+else:
+
+    def _iscoroutinefunction_or_partial(func: Any) -> bool:
+        # Python < 3.8 does not correctly determine partially wrapped
+        # coroutine functions are coroutine functions, hence the need for
+        # this to exist. Code taken from CPython.
+        while inspect.ismethod(func):
+            func = func.__func__
+        while isinstance(func, functools.partial):
+            func = func.func
+
+        return iscoroutinefunction(func)

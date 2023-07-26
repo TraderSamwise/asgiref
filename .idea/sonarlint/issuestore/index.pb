@@ -1,0 +1,9 @@
+
+8
+setup.py,8/e/8e2edce0d507e1297474f25c00cae94258db38d8
+9
+	setup.cfg,8/c/8c91c0296909b5ea3c496fde69e9dc44a6c6ae5f
+A
+asgiref/server.py,5/b/5b3066123e842b09653ba957631ceb84896e9d02
+?
+asgiref/sync.py,9/0/90e02f3550c7446cbdff47f6859c347a95122316
